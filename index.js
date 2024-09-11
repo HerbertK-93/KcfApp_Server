@@ -3,10 +3,15 @@ const dotenv = require('dotenv');
 const express = require('express');
 const bodyParser = require('body-parser');
 
-dotenv.config();
+dotenv.config();  // Load environment variables from .env
 
+// Initialize Firebase Admin SDK using environment variables
 admin.initializeApp({
-  credential: admin.credential.applicationDefault(),
+  credential: admin.credential.cert({
+    project_id: process.env.FIREBASE_PROJECT_ID,
+    private_key: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),  // Replace escaped newlines with actual newlines
+    client_email: process.env.FIREBASE_CLIENT_EMAIL,
+  }),
   databaseURL: "https://kings-cogent-finance-ltd-ecab6.firebaseio.com"
 });
 
@@ -27,46 +32,99 @@ app.post('/flutterwave-webhook', async (req, res, next) => {
 
   try {
     const txRef = event?.data?.tx_ref;
-    const uid = event?.data?.customer?.uid;
+    const email = event?.data?.customer?.email;
+    const status = event?.data?.status;
+    const amount = event?.data?.amount;  // Amount of the transaction
+    const transactionDate = new Date().toLocaleString();  // Get current date and time
 
-    // Validate txRef and uid before proceeding
-    if (!txRef || typeof txRef !== 'string' || txRef.trim() === '') {
-      return res.status(400).json({ error: 'Invalid transaction reference (tx_ref)' });
-    }
-    if (!uid || typeof uid !== 'string' || uid.trim() === '') {
-      return res.status(400).json({ error: 'Invalid user ID (uid)' });
+    // Log txRef, email, amount, and status for debugging
+    console.log('Transaction Reference (txRef):', txRef);
+    console.log('User Email:', email);
+    console.log('Transaction Amount:', amount);
+    console.log('Transaction Status:', status);
+
+    // Retrieve the user by email to get their UID
+    const usersRef = firestore.collection('users');
+    const querySnapshot = await usersRef.where('email', '==', email).get();
+
+    if (querySnapshot.empty) {
+      return res.status(400).json({ error: 'User not found' });
     }
 
+    // Assume the first user document found corresponds to the email
+    const userDoc = querySnapshot.docs[0];
+    const uid = userDoc.id;
+
+    // Transaction data to be updated with the new status
     const transactionData = {
-      tx_ref: txRef,
-      amount: event.data.amount,
-      currency: event.data.currency,
-      status: event.data.status,
-      date: new Date().toISOString(),
+      status: status,  // Update the status from the event data
+      amount: amount,  // Include the transaction amount
+      updated_at: new Date().toISOString(),
     };
 
-    await firestore 
-      .collection('users')
-      .doc(uid)
-      .collection('transactions')
-      .doc(txRef)
-      .set(transactionData);
+    // Update the transaction status under the user's UID
+    await firestore
+      .collection('users')            // Collection for all users
+      .doc(uid)                       // Use UID as the document ID for the user
+      .collection('transactions')     // Subcollection for transactions
+      .doc(txRef)                     // Use tx_ref as the document ID for the transaction
+      .set(transactionData, { merge: true });  // Merge the status update with existing data
 
-    return res.status(200).send('Transaction stored successfully');
+    // Retrieve the FCM token from the user's document
+    const userData = userDoc.data();
+    const fcmToken = userData.fcmToken;  // Ensure the FCM token is stored in Firestore
+
+    const notificationData = {
+      title: `Transaction ${status}`,
+      body: `Amount: ${amount}\nReference: ${txRef}\nDate: ${transactionDate}\nStatus: ${status}`,
+      tx_ref: txRef,
+      amount: amount,
+      status: status,
+      timestamp: new Date(),
+      read: false  // Mark notification as unread initially
+    };
+
+    // Store the notification in the Firestore subcollection
+    await firestore.collection('users').doc(uid).collection('notifications').add(notificationData);
+
+    if (fcmToken) {
+      // Prepare the message with transaction details
+      const message = {
+        notification: {
+          title: `Transaction ${status}`,
+          body: `Amount: ${amount}\nReference: ${txRef}\nDate: ${transactionDate}\nStatus: ${status}`,
+        },
+        token: fcmToken,
+      };
+
+      // Send the push notification
+      await admin.messaging().send(message)
+        .then((response) => {
+          console.log('Notification sent successfully:', response);
+        })
+        .catch((error) => {
+          console.error('Error sending notification:', error);
+        });
+    } else {
+      console.log("FCM token not found for user, notification not sent.");
+    }
+
+    return res.status(200).send('Transaction updated successfully');
   } catch (error) {
     console.error('Error storing transaction:', error);
     return res.status(500).send('Internal Server Error');
   }
 });
 
+// Test route
 app.post('/test', async (req, res, next) => {
   try {
     return res.status(200).send('This is working');
   } catch (error) {
-    console.error('Error storing transaction:', error);
+    console.error('Error:', error);
     return res.status(500).send('Internal Server Error');
   }
-})
+});
 
 // Global error handler middleware
 app.use((err, req, res, next) => {
@@ -76,5 +134,5 @@ app.use((err, req, res, next) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log('Server is running on port ${PORT}');
+  console.log(`Server is running on port ${PORT}`);
 });
